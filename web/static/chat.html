@@ -43,6 +43,7 @@
             border-radius: 5px;
         }
         .message.system { background: #1a1a2e; font-style: italic; }
+        .message.history { opacity: 0.7; border-left: 3px solid #e94560; }
         .message-user { color: #e94560; font-weight: bold; }
         .message-time { color: #999; font-size: 0.8em; margin-left: 10px; }
         #input-area {
@@ -69,6 +70,17 @@
             font-weight: bold;
         }
         button:hover { background: #d63447; }
+        button:disabled { background: #666; cursor: not-allowed; }
+        .error { color: #e94560; padding: 10px; text-align: center; }
+        .status {
+            padding: 5px 10px;
+            font-size: 0.8em;
+            text-align: center;
+            background: #1a1a2e;
+        }
+        .status.connected { color: #4ade80; }
+        .status.disconnected { color: #e94560; }
+        .status.connecting { color: #fbbf24; }
     </style>
 </head>
 <body>
@@ -81,7 +93,9 @@
             <div style="padding: 20px;">
                 <input type="text" id="username-input" placeholder="Username" style="width: 100%; margin-bottom: 10px;">
                 <input type="text" id="room-input" placeholder="Room (default: general)" style="width: 100%; margin-bottom: 10px;">
+                <input type="password" id="token-input" placeholder="Auth Token (if required)" style="width: 100%; margin-bottom: 10px;">
                 <button onclick="joinChat()" style="width: 100%;">Join Chat</button>
+                <div id="login-error" class="error" style="display: none;"></div>
             </div>
         </div>
 
@@ -89,10 +103,11 @@
             <div class="header">
                 <h1 id="room-title">Chat Room</h1>
             </div>
+            <div id="connection-status" class="status connecting">Connecting...</div>
             <div id="messages"></div>
             <div id="input-area">
                 <input type="text" id="message-input" placeholder="Type a message..." onkeypress="if(event.key === 'Enter') sendMessage()">
-                <button onclick="sendMessage()">Send</button>
+                <button id="send-btn" onclick="sendMessage()">Send</button>
             </div>
         </div>
     </div>
@@ -101,13 +116,18 @@
         let ws;
         let username;
         let room;
+        let token;
+        let reconnectAttempts = 0;
+        let maxReconnectAttempts = 5;
+        let historyLoaded = false;
 
         function joinChat() {
             username = document.getElementById('username-input').value.trim();
             room = document.getElementById('room-input').value.trim() || 'general';
-            
+            token = document.getElementById('token-input').value.trim();
+
             if (!username) {
-                alert('Please enter a username');
+                showLoginError('Please enter a username');
                 return;
             }
 
@@ -118,24 +138,69 @@
             connectWebSocket();
         }
 
+        function showLoginError(message) {
+            const errorEl = document.getElementById('login-error');
+            errorEl.textContent = message;
+            errorEl.style.display = 'block';
+        }
+
+        function updateStatus(status, message) {
+            const statusEl = document.getElementById('connection-status');
+            statusEl.className = 'status ' + status;
+            statusEl.textContent = message;
+
+            const sendBtn = document.getElementById('send-btn');
+            const messageInput = document.getElementById('message-input');
+            sendBtn.disabled = status !== 'connected';
+            messageInput.disabled = status !== 'connected';
+        }
+
         function connectWebSocket() {
+            updateStatus('connecting', 'Connecting...');
+
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//${window.location.host}/ws?username=${encodeURIComponent(username)}&room=${encodeURIComponent(room)}`;
-            
+            let wsUrl = `${protocol}//${window.location.host}/ws?username=${encodeURIComponent(username)}&room=${encodeURIComponent(room)}`;
+
+            if (token) {
+                wsUrl += `&token=${encodeURIComponent(token)}`;
+            }
+
             ws = new WebSocket(wsUrl);
 
             ws.onopen = () => {
                 console.log('Connected to chat server');
+                updateStatus('connected', 'Connected');
+                reconnectAttempts = 0;
+                historyLoaded = false;
             };
 
             ws.onmessage = (event) => {
                 const message = JSON.parse(event.data);
-                displayMessage(message);
+                displayMessage(message, !historyLoaded && message.type === 'message');
+
+                // After first join message, history is loaded
+                if (message.type === 'join' && message.username === username) {
+                    historyLoaded = true;
+                }
             };
 
-            ws.onclose = () => {
-                console.log('Disconnected from chat server');
-                setTimeout(connectWebSocket, 3000);
+            ws.onclose = (event) => {
+                console.log('Disconnected from chat server', event.code, event.reason);
+
+                if (event.code === 1008 || event.code === 4001) {
+                    // Policy violation or unauthorized
+                    updateStatus('disconnected', 'Unauthorized - check your auth token');
+                    return;
+                }
+
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 30000);
+                    updateStatus('disconnected', `Disconnected. Reconnecting in ${delay/1000}s...`);
+                    setTimeout(connectWebSocket, delay);
+                } else {
+                    updateStatus('disconnected', 'Connection lost. Please refresh the page.');
+                }
             };
 
             ws.onerror = (error) => {
@@ -146,7 +211,7 @@
         function sendMessage() {
             const input = document.getElementById('message-input');
             const content = input.value.trim();
-            
+
             if (!content || !ws || ws.readyState !== WebSocket.OPEN) return;
 
             const message = {
@@ -157,25 +222,31 @@
             input.value = '';
         }
 
-        function displayMessage(message) {
+        function displayMessage(message, isHistory) {
             const messagesDiv = document.getElementById('messages');
             const messageEl = document.createElement('div');
-            
+
             if (message.type === 'join' || message.type === 'leave') {
                 messageEl.className = 'message system';
                 messageEl.textContent = message.content;
             } else {
-                messageEl.className = 'message';
+                messageEl.className = 'message' + (isHistory ? ' history' : '');
                 const time = new Date(message.time).toLocaleTimeString();
                 messageEl.innerHTML = `
-                    <span class="message-user">${message.username}</span>
+                    <span class="message-user">${escapeHtml(message.username)}</span>
                     <span class="message-time">${time}</span>
-                    <div>${message.content}</div>
+                    <div>${escapeHtml(message.content)}</div>
                 `;
             }
-            
+
             messagesDiv.appendChild(messageEl);
             messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
         }
     </script>
 </body>

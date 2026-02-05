@@ -1,27 +1,44 @@
 package chat
 
 import (
+	"context"
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"time"
 
+	"github.com/TrailBlazors/realtime-chat-railway/internal/config"
 	"github.com/gorilla/websocket"
 )
 
 const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = (pongWait * 9) / 10
-	maxMessageSize = 512
+	writeWait  = 10 * time.Second
+	pongWait   = 60 * time.Second
+	pingPeriod = (pongWait * 9) / 10
 )
 
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for demo (restrict in production!)
-	},
+var (
+	cfg      *config.Config
+	upgrader websocket.Upgrader
+)
+
+func InitClient(c *config.Config) {
+	cfg = c
+	upgrader = websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin: func(r *http.Request) bool {
+			origin := r.Header.Get("Origin")
+			if origin == "" {
+				return true // Allow requests without Origin header (e.g., from same origin)
+			}
+			allowed := cfg.IsOriginAllowed(origin)
+			if !allowed {
+				slog.Warn("rejected connection from disallowed origin", "origin", origin)
+			}
+			return allowed
+		},
+	}
 }
 
 type Client struct {
@@ -35,11 +52,10 @@ type Client struct {
 func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
-		log.Println(err)
+		slog.Error("websocket upgrade failed", "error", err)
 		return
 	}
 
-	// Get room and username from query params
 	room := r.URL.Query().Get("room")
 	username := r.URL.Query().Get("username")
 
@@ -60,6 +76,29 @@ func ServeWs(hub *Hub, w http.ResponseWriter, r *http.Request) {
 
 	client.hub.register <- client
 
+	slog.Info("client connected",
+		"username", username,
+		"room", room,
+		"remote_addr", r.RemoteAddr,
+	)
+
+	// Send recent messages from history
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	messages, err := hub.store.GetRecentMessages(ctx, room, 50)
+	cancel()
+
+	if err != nil {
+		slog.Warn("failed to load message history", "error", err, "room", room)
+	} else {
+		for _, msg := range messages {
+			data, _ := json.Marshal(msg)
+			select {
+			case client.send <- data:
+			default:
+			}
+		}
+	}
+
 	// Send join message
 	joinMsg := Message{
 		Type:     "join",
@@ -79,7 +118,11 @@ func (c *Client) readPump() {
 		c.hub.unregister <- c
 		c.conn.Close()
 
-		// Send leave message
+		slog.Info("client disconnected",
+			"username", c.username,
+			"room", c.room,
+		)
+
 		leaveMsg := Message{
 			Type:     "leave",
 			Username: c.username,
@@ -90,6 +133,7 @@ func (c *Client) readPump() {
 		c.hub.BroadcastMessage(leaveMsg)
 	}()
 
+	c.conn.SetReadLimit(cfg.MaxMessageSize)
 	c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -100,14 +144,20 @@ func (c *Client) readPump() {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+				slog.Warn("unexpected websocket close",
+					"error", err,
+					"username", c.username,
+				)
 			}
 			break
 		}
 
 		var msg Message
 		if err := json.Unmarshal(message, &msg); err != nil {
-			log.Printf("error unmarshaling message: %v", err)
+			slog.Warn("failed to unmarshal message",
+				"error", err,
+				"username", c.username,
+			)
 			continue
 		}
 
